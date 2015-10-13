@@ -67,7 +67,9 @@ sub new {
         interactive => undef,
         log => undef,
         mirrors => [],
+          mirror_apis => [],
         mirror_only => undef,
+          api_only    => undef,
         mirror_index => undef,
         cpanmetadb => "http://cpanmetadb.plackperl.org/v1.0/",
         perl => $^X,
@@ -176,12 +178,14 @@ sub parse_options {
         'self-contained!' => \$self->{self_contained},
         'exclude-vendor!' => \$self->{exclude_vendor},
         'mirror=s@' => $self->{mirrors},
+        'mirror-api=s@' => $self->{mirror_apis},
         'mirror-only!' => \$self->{mirror_only},
         'mirror-index=s' => sub { $self->{mirror_index} = $self->maybe_abs($_[1]) },
         'M|from=s' => sub {
             $self->{mirrors}     = [$_[1]];
             $self->{mirror_only} = 1;
         },
+        'api-only!'       => \$self->{api_only},
         'cpanmetadb=s'    => \$self->{cpanmetadb},
         'cascade-search!' => \$self->{cascade_search},
         'prompt!'   => \$self->{prompt},
@@ -453,16 +457,25 @@ sub search_mirror_index {
     $self->search_mirror_index_file($self->package_index_for($mirror), $module, $version);
 }
 
+my %cache_index_lookup;
 sub search_mirror_index_file {
     my($self, $file, $module, $version) = @_;
 
-    open my $fh, '<', $file or return;
-    my $found;
-    while (<$fh>) {
-        if (m!^\Q$module\E\s+([\w\.]+)\s+(\S*)!m) {
-            $found = $self->cpan_module($module, $2, $1);
-            last;
+    $cache_index_lookup{$file} //= do {
+        open my $fh, '<', $file or return;
+        my $data;
+        while (<$fh>) {
+            chomp;
+            my ($mod,$ver,$tar) = split /\s+/;
+            $data->{$mod} = [$ver, $tar];
         }
+        $data;
+    };
+
+    my $found;
+    if ($cache_index_lookup{$file}{$module}) {
+        my ($ver, $tar) = @{$cache_index_lookup{$file}{$module}};
+        $found = $self->cpan_module($module, $tar, $ver);
     }
 
     return $found unless $self->{cascade_search};
@@ -494,7 +507,7 @@ sub encode_json {
 
 # TODO extract this as a module?
 sub version_to_query {
-    my($self, $module, $version) = @_;
+      my($self, $module, $version, $supports_regexp) = @_;
 
     require CPAN::Meta::Requirements;
 
@@ -504,6 +517,24 @@ sub version_to_query {
     my $req = $requirements->requirements_for_module($module);
 
     if ($req =~ s/^==\s*//) {
+          if ($req =~ /^v/ and $supports_regexp) {
+              ### If we are searching for v-string versions we need to  
+              ### ignore leading zeros when searching for an exact match because
+              ### there is no standard way for expressing versions with
+              ### >2 tuples and leading zeros and unfortunately if the
+              ### version requirements_for_module returned is formatted 
+              ### slightly differently from what's in the metacpan api then
+              ### it won't match.
+              ### NOTE however that this regexp syntax doesn't seem to work on
+              ### metacpan's api (old ES version)... only on our internal gsgpan
+              $req =~ s/([_.])/${1}0*/g;
+              $req =~ s/^v/v?/;
+
+              return {
+                  regexp => { 'module.version' => $req },
+              }
+          }
+
         return {
             term => { 'module.version' => $req },
         };
@@ -567,18 +598,19 @@ sub maturity_filter {
     }
 }
 
-sub by_version {
-    my %s = qw( latest 3  cpan 2  backpan 1 );
-    $b->{_score} <=> $a->{_score} ||                             # version: higher version that satisfies the query
-    $s{ $b->{fields}{status} } <=> $s{ $a->{fields}{status} };   # prefer non-BackPAN dist
-}
-
 sub by_first_come {
     $a->{fields}{date} cmp $b->{fields}{date};                   # first one wins, if all are in BackPAN/CPAN
 }
 
 sub by_date {
     $b->{fields}{date} cmp $a->{fields}{date};                   # prefer new uploads, when searching for dev
+}
+
+sub by_version {
+    my %s = qw( latest 3  cpan 2  backpan 1 );
+    $b->{_score} <=> $a->{_score} ||                             # version: higher version that satisfies the query
+    $s{ $b->{fields}{status} } <=> $s{ $a->{fields}{status} } || # prefer non-BackPAN dist
+    ( $a->{_score} == 0 ? by_date : 0 ) # seems to make more sense than by first_come in this case
 }
 
 sub find_best_match {
@@ -597,76 +629,93 @@ sub search_metacpan {
 
     $self->chat("Searching $module ($version) on metacpan ...\n");
 
-    my $metacpan_uri = 'http://api.metacpan.org/v0';
+    my @cpan_apis = @{ $self->{mirror_apis} };
+    push @cpan_apis, 'http://api.metacpan.org/v0';
 
-    my @filter = $self->maturity_filter($module, $version);
-
-    my $query = { filtered => {
-        (@filter ? (filter => { and => \@filter }) : ()),
-        query => { nested => {
-            score_mode => 'max',
-            path => 'module',
-            query => { custom_score => {
-                metacpan_script => "score_version_numified",
-                query => { constant_score => {
-                    filter => { and => [
-                        { term => { 'module.authorized' => JSON::PP::true() } },
-                        { term => { 'module.indexed' => JSON::PP::true() } },
-                        { term => { 'module.name' => $module } },
-                        $self->version_to_query($module, $version),
-                    ] }
+    for my $metacpan_uri (@cpan_apis) {
+    
+        my @filter = $self->maturity_filter($module, $version);
+        # Metacpan is running an ancient version of ElasticSearch.
+        # Assume other mirrors by default are running more recent versions.
+        # TODO...Not sure how best to handle this
+        my $supports_regexp = $metacpan_uri !~ /api.metacpan.org/;
+    
+        my $query = { filtered => {
+            (@filter ? (filter => { and => \@filter }) : ()),
+            query => { nested => {
+                score_mode => 'max',
+                path => 'module',
+                query => { custom_score => {
+                    metacpan_script => "score_version_numified",
+                    query => { constant_score => {
+                        filter => { and => [
+                            { term => { 'module.authorized' => JSON::PP::true() } },
+                            { term => { 'module.indexed' => JSON::PP::true() } },
+                            { term => { 'module.name' => $module } },
+                            $self->version_to_query($module, $version, $supports_regexp),
+                        ] }
+                    } },
                 } },
             } },
-        } },
-    } };
-
-    my $module_uri = "$metacpan_uri/file/_search?source=";
-    $module_uri .= $self->encode_json({
-        query => $query,
-        fields => [ 'date', 'release', 'author', 'module', 'status' ],
-    });
-
-    my($release, $author, $module_version);
-
-    my $module_json = $self->get($module_uri);
-    my $module_meta = eval { JSON::PP::decode_json($module_json) };
-    my $match = $self->find_best_match($module_meta);
-    if ($match) {
-        $release = $match->{release};
-        $author = $match->{author};
-        my $module_matched = (grep { $_->{name} eq $module } @{$match->{module}})[0];
-        $module_version = $module_matched->{version};
-    }
-
-    unless ($release) {
-        $self->chat("! Could not find a release matching $module ($version) on MetaCPAN.\n");
-        return;
-    }
-
-    my $dist_uri = "$metacpan_uri/release/_search?source=";
-    $dist_uri .= $self->encode_json({
-        filter => { and => [
-            { term => { 'release.name' => $release } },
-            { term => { 'release.author' => $author } },
-        ]},
-        fields => [ 'download_url', 'stat', 'status' ],
-    });
-
-    my $dist_json = $self->get($dist_uri);
-    my $dist_meta = eval { JSON::PP::decode_json($dist_json) };
-
-    if ($dist_meta) {
-        $dist_meta = $dist_meta->{hits}{hits}[0]{fields};
-    }
-    if ($dist_meta && $dist_meta->{download_url}) {
-        (my $distfile = $dist_meta->{download_url}) =~ s!.+/authors/id/!!;
-        local $self->{mirrors} = $self->{mirrors};
-        if ($dist_meta->{status} eq 'backpan') {
-            $self->{mirrors} = [ 'http://backpan.perl.org' ];
-        } elsif ($dist_meta->{stat}{mtime} > time()-24*60*60) {
-            $self->{mirrors} = [ 'http://cpan.metacpan.org' ];
+        } };
+    
+        my $module_uri = "$metacpan_uri/file/_search?source=";
+        $module_uri .= $self->encode_json({
+            query  => $query,
+            sort   => [ { date => 'desc' } ],
+            fields => [ 'date', 'release', 'author', 'module', 'status' ],
+        });
+    
+        my($release, $author, $module_version);
+    
+        my $module_json = $self->get($module_uri);
+        my $module_meta = eval { JSON::PP::decode_json($module_json) };
+        my $match = $self->find_best_match($module_meta);
+        if ($match) {
+            $release = $match->{release};
+            $author = $match->{author};
+            my $module_matched = (grep { $_->{name} eq $module } @{$match->{module}})[0];
+            $module_version = $module_matched->{version};
         }
-        return $self->cpan_module($module, $distfile, $module_version);
+    
+        unless ($release) {
+            $self->chat("! Could not find a release matching $module ($version) via CPAN API ($metacpan_uri).\n");
+            next;
+        }
+    
+        my $dist_uri = "$metacpan_uri/release/_search?source=";
+        $dist_uri .= $self->encode_json({
+            filter => { and => [
+                { term => { 'release.name' => $release } },
+                { term => { 'release.author' => $author } },
+            ]},
+            fields => [ 'download_url', 'stat', 'status' ],
+        });
+    
+        my $dist_json = $self->get($dist_uri);
+        my $dist_meta = eval { JSON::PP::decode_json($dist_json) };
+    
+        if ($dist_meta) {
+            $dist_meta = $dist_meta->{hits}{hits}[0]{fields};
+        }
+        if ($dist_meta && $dist_meta->{download_url}) {
+            (my $distfile = $dist_meta->{download_url}) =~ s!.+/authors/id/!!;
+            local $self->{mirrors} = $self->{mirrors};
+            if ($dist_meta->{status} eq 'backpan') {
+                push @{$self->{mirrors}}, 'http://backpan.perl.org'
+                  unless grep /backpan.perl.org/, @{$self->{mirrors}};
+            } elsif ($dist_meta->{stat}{mtime} > time()-24*60*60) {
+                push @{$self->{mirrors}}, 'http://cpan.metacpan.org'
+                  unless grep /cpan.metacpan.org/, @{$self->{mirrors}};
+            }
+            return $self->cpan_module($module, $distfile, $module_version);
+        }
+    }
+
+    if (not $self->{dev_release}) {
+        ### If the module /only/ has dev releases then we should get one.
+        local $self->{dev_release} = 1; 
+        return $self->search_metacpan($module, $version);
     }
 
     $self->diag_fail("Finding $module on metacpan failed.");
@@ -678,7 +727,7 @@ sub search_database {
 
     my $found;
 
-    if ($self->{dev_release} or $self->{metacpan}) {
+    if ($self->{dev_release} or $self->{metacpan} or @{$self->{mirror_apis}}) {
         $found = $self->search_metacpan($module, $version)   and return $found;
         $found = $self->search_cpanmetadb($module, $version) and return $found;
     } else {
@@ -770,6 +819,10 @@ sub search_module {
         my $found = $self->search_database($module, $version);
         return $found if $found;
     }
+      if ($self->{api_only}) {
+          $self->mask_output( diag_fail => "Finding $module ($version) on apis failed." );
+          return;
+      }
 
     MIRROR: for my $mirror (@{ $self->{mirrors} }) {
         $self->mask_output( chat => "Searching $module on mirror $mirror ...\n" );
@@ -1401,12 +1454,6 @@ sub install_module {
 
     $self->check_libs;
 
-    if ($self->{seen}{$module}++) {
-        # TODO: circular dependencies
-        $self->chat("Already tried $module. Skipping.\n");
-        return 1;
-    }
-
     if ($self->{skip_satisfied}) {
         my($ok, $local) = $self->check_module($module, $version || 0);
         if ($ok) {
@@ -1415,48 +1462,83 @@ sub install_module {
         }
     }
 
-    my $dist = $self->resolve_name($module, $version);
-    unless ($dist) {
-        my $what = $module . ($version ? " ($version)" : "");
-        $self->diag_fail("Couldn't find module or a distribution $what", 1);
-        return;
-    }
-
-    if ($dist->{distvname} && $self->{seen}{$dist->{distvname}}++) {
-        $self->chat("Already tried $dist->{distvname}. Skipping.\n");
-        return 1;
-    }
-
-    if ($self->{cmd} eq 'info') {
-        print $self->format_dist($dist), "\n";
-        return 1;
-    }
-
-    $dist->{depth} = $depth; # ugly hack
-
-    if ($dist->{module}) {
-        unless ($self->satisfy_version($dist->{module}, $dist->{module_version}, $version)) {
-            $self->diag("Found $dist->{module} $dist->{module_version} which doesn't satisfy $version.\n", 1);
+      my $ret; 
+      # Allow for up to 10 circular dep version requirement changes 
+      # but protect against inf looping
+      for (1..10) { 
+          my $dist = $self->resolve_name($module, $version);
+          unless ($dist) {
+              my $what = $module . ($version ? " ($version)" : "");
+              $self->diag_fail("Couldn't find module or a distribution $what", 1);
             return;
         }
+      
+          # Look for circular deps that require the original
+          # distribution to be reinstalled.
+          my ($circular_dep_dist) = grep { 
+            ($dist->{dist}    // '') eq ($_->{dist}    // '') and 
+            ($dist->{version} // '') ne ($_->{version} // '')
+          } @{$self->{building} // []};
 
-        # If a version is requested, it has to be the exact same version, otherwise, check as if
-        # it is the minimum version you need.
-        my $cmp = $version ? "==" : "";
-        my $requirement = $dist->{module_version} ? "$cmp$dist->{module_version}" : 0;
-        my($ok, $local) = $self->check_module($dist->{module}, $requirement);
-        if ($self->{skip_installed} && $ok) {
-            $self->diag("$dist->{module} is up to date. ($local)\n", 1);
+          if ($circular_dep_dist) {
+              $circular_dep_dist->{retry_version} = $version;
+              return 1; 
+          }
+
+          if ($dist->{distvname} && $self->{seen}{$dist->{distvname}}++) {
+              $self->chat("Already tried $dist->{distvname}. Skipping.\n");
             return 1;
         }
-    }
+      
+          if ($self->{cmd} eq 'info') {
+              print $self->format_dist($dist), "\n";
+              return 1;
+          }
+      
+          $dist->{depth} = $depth; # ugly hack
+      
+          if ($dist->{module}) {
+              unless ($self->satisfy_version($dist->{module}, $dist->{module_version}, $version)) {
+                  $self->diag("Found $dist->{module} $dist->{module_version} which doesn't satisfy $version.\n", 1);
+                  return;
+              }
+      
+              # If a version is requested, it has to be the exact same version, otherwise, check as if
+              # it is the minimum version you need.
+              my $cmp = $version ? "==" : "";
+              my $requirement = $dist->{module_version} ? "$cmp$dist->{module_version}" : 0;
+              my($ok, $local) = $self->check_module($dist->{module}, $requirement);
+              if ($self->{skip_installed} && $ok) {
+                  $self->diag("$dist->{module} is up to date. ($local)\n", 1);
+                  return 1;
+              }
+          }
+      
+          if ($dist->{dist} eq 'perl'){
+              $self->diag("skipping $dist->{pathname}\n");
+              return 1;
+          }
+      
+          $self->diag("--> Working on $module\n");
 
-    if ($dist->{dist} eq 'perl'){
-        $self->diag("skipping $dist->{pathname}\n");
-        return 1;
-    }
+          push @{$self->{building}}, $dist; # For circular dep detection
+          $ret = $self->install_distribution($module, $dist, $depth);
+          pop  @{$self->{building}};
 
-    $self->diag("--> Working on $module\n");
+          # Circ dep may have changed module version requirement 
+          if ($dist->{retry_version}) {
+              $self->diag("Conflicting circular dependency for $dist->{distvname}.\n".
+                          "  Will retry with $dist->{retry_version} instead.\n", 1 );
+              $version = delete $dist->{retry_version};
+              next;
+          }
+          last
+    }
+      return $ret;
+  }
+
+  sub install_distribution {
+      my ($self, $module, $dist, $depth) = @_;
 
     $dist->{dir} ||= $self->fetch_module($dist);
 
@@ -1636,20 +1718,21 @@ sub fetch_module {
 
         my $cancelled;
         my $fetch = sub {
-            my $file;
+              my ($file, $http_code);
             eval {
                 local $SIG{INT} = sub { $cancelled = 1; die "SIGINT\n" };
-                $self->mirror($uri, $name);
+                  $http_code = $self->mirror($uri, $name);
                 $file = $name if -e $name;
             };
             $self->diag("ERROR: " . trim("$@") . "\n", 1) if $@ && $@ ne "SIGINT\n";
-            return $file;
+              return ($file, $http_code);
         };
 
-        my($try, $file);
+          my($try, $file, $http_code);
         while ($try++ < 3) {
-            $file = $fetch->();
-            last if $cancelled or $file;
+              ($file, $http_code) = $fetch->();
+              $http_code ||= '';
+              last if $cancelled or $file or $http_code eq '404';
             $self->mask_output( diag_fail => "Download $uri failed. Retrying ... ");
         }
 
@@ -1658,7 +1741,12 @@ sub fetch_module {
             return;
         }
 
-        unless ($file) {
+          if ($http_code eq '404') {
+              $self->diag_ok("NOT FOUND");
+              next;
+          }
+
+          unless ($file and -s $file) {
             $self->mask_output( diag_fail => "Failed to download $uri");
             next;
         }
@@ -1806,8 +1894,20 @@ sub verify_signature {
     }
 }
 
+my %dist_cache;
 sub resolve_name {
     my($self, $module, $version) = @_;
+
+    $dist_cache{$module}{$version} //= 
+        $self->_resolve_name($module, $version);
+
+    return $dist_cache{$module}{$version};
+}
+
+sub _resolve_name {
+    my($self, $module, $version) = @_;
+
+    return { } if $module eq 'perl';
 
     # Git
     if ($module =~ /(?:^git:|\.git(?:@.+)?$)/) {
@@ -2118,8 +2218,21 @@ sub unsatisfied_deps {
     require CPAN::Meta::Requirements;
 
     my $reqs = CPAN::Meta::Requirements->new;
-    for my $dep (grep $_->is_requirement, @deps) {
-        $reqs->add_string_requirement($dep->module => $dep->requires_version || '0');
+    DEP: for my $dep (grep $_->is_requirement, @deps) {
+        # Search for circular deps so that they aren't marked as failures.
+        my $dist = $self->resolve_name($dep->module, $dep->version);
+        my $len = $#{$self->{building}};
+        for my $i (0..$len) {
+            last unless $dist->{dist};
+            if (($self->{building}[$i]{dist} || '') eq $dist->{dist}) {
+                my $circ_dep = join " => ", map( $_->{dist}, @{$self->{building}}[$i..$len]), $dist->{dist};
+                $self->diag( "Found circular dependency: $circ_dep\n", 1 )
+                    unless $self->{warned_circ_dep}{$circ_dep}++;
+                next DEP; # Skip it so that it's not reported as 'not installed' below
+            }
+        }
+
+        $reqs->add_string_requirement($dep->module => $dep->version);
     }
 
     my $ret = CPAN::Meta::Check::check_requirements($reqs, 'requires', $self->{search_inc});
@@ -2486,6 +2599,17 @@ sub save_meta {
 
     File::Path::mkpath("blib/meta", 0, 0777);
 
+    # Prune existing metas for this module
+    my $meta_dir = "$base/$Config{archname}/.meta";
+    if (-d $meta_dir) {
+        opendir(my $mdh, $meta_dir) || warn "Can't opendir $meta_dir: $!";
+        while (my $entry = readdir $mdh) {
+            next unless $entry =~ /^$dist->{dist}-[v\d\._]+(-TRIAL)?$/i;
+            File::Path::rmtree("$meta_dir/$entry");
+        }
+        closedir $mdh;
+    }
+
     my $local = {
         name => $module_name,
         target => $module,
@@ -2504,13 +2628,17 @@ sub save_meta {
     if (-e "MYMETA.json") {
         File::Copy::copy("MYMETA.json", "blib/meta/MYMETA.json");
     }
+    if (-e "cpanfile") {
+        File::Copy::copy("cpanfile", "blib/meta/cpanfile");
+        system("cp -a cpanfile.prerelease blib/meta 2>/dev/null")
+    }
 
     my @cmd = (
         ($self->{sudo} ? 'sudo' : ()),
         $^X,
         '-MExtUtils::Install=install',
         '-e',
-        qq[install({ 'blib/meta' => '$base/$Config{archname}/.meta/$dist->{distvname}' })],
+        qq[install({ 'blib/meta' => '$meta_dir/$dist->{distvname}' })],
     );
     $self->run(\@cmd);
 }
@@ -2602,6 +2730,12 @@ sub find_prereqs {
 
 sub extract_meta_prereqs {
     my($self, $dist) = @_;
+
+    if (not $dist->{cpanfile} and -e "cpanfile") {
+        require Module::CPANfile;
+        $self->chat("Checking dependencies from cpanfile ...\n");
+        $dist->{cpanfile} = Module::CPANfile->load("cpanfile");
+    }
 
     if ($dist->{cpanfile}) {
         my @features = $self->configure_features($dist, $dist->{cpanfile}->features);
@@ -2931,6 +3065,7 @@ sub init_tools {
         my @common = (
             '--user-agent', $self->agent,
             '--retry-connrefused',
+            '--no-check-certificate',
             ($self->{verbose} ? () : ('-q')),
         );
         $self->{_backends}{get} = sub {
@@ -2949,6 +3084,7 @@ sub init_tools {
         $self->chat("You have $curl\n");
         my @common = (
             '--location',
+            '--fail',
             '--user-agent', $self->agent,
             ($self->{verbose} ? () : '-s'),
         );
@@ -2960,7 +3096,7 @@ sub init_tools {
         };
         $self->{_backends}{mirror} = sub {
             my($self, $uri, $path) = @_;
-            $self->safeexec( my $fh, $curl, @common, $uri, '-#', '-o', $path ) or die "curl $uri: $!";
+            $self->safeexec( my $fh, $curl, @common, $uri, '-w', '%{http_code}', '-#', '-o', $path ) or die "curl $uri: $!";
             local $/;
             <$fh>;
         };

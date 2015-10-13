@@ -13,7 +13,8 @@ sub from_prereqs {
         );
     }
 
-    return @deps;
+      # Sort so that we install modules in a consistent order 
+      return sort { $a->module cmp $b->module } @deps;
 }
 
 sub from_versions {
@@ -24,7 +25,8 @@ sub from_versions {
         push @deps, $class->new($module, $version, $type)
     }
 
-    @deps;
+      # Sort so that we install modules in a consistent order 
+      return sort { $a->module cmp $b->module } @deps;
 }
 
 sub merge_with {

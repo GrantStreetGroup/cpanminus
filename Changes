@@ -2,6 +2,34 @@ See http://github.com/miyagawa/cpanminus/ for the latest development.
 
 {{$NEXT}}
 
+1.7039.1  2015-10-13 10:34:00 EDT
+    PK: Applied all the GSG patches
+      - Add an --api-only flag to keep cpanm from consulting packages02.txt 
+        because in some darkpans that file may be inaccurate.
+      - Add support for --mirror-api
+      - A few performance improvements
+      - Allow exact matching of versions containing 
+        leading zeros in their alpha component.
+      - Clear out old .meta files
+      - Correctly find non-latest-non-v-string versions 
+        with > 2 tuples (like PDF-Table-0.9.5)
+      - Correctly find versions with > 2 tuples and leading zeros (like 1.02.3)
+      - Correctly handle versionless sub-modules (otherwise chooses a random old one)
+      - Do version checking across sub-dep levels
+      - First try to download recent packages from mirrors 
+        before failing over to cpan.metacpan.org
+      - If a mirror returns 404 don't display it as a failure and don't bother retrying.
+      - Improve dev-version support so that a dev version is pulled in 
+        if the release only has dev versions even if --dev is not specified.
+      - Install modules in consistent order
+      - Make curl create an empty file if it gets a 404
+      - Properly handle circular deps
+      - Read sub dependencies from cpanfile instead of MYMETA.yml
+      - Restrict the regex patch to v-strings dev versions since regexp 
+        doesn't work on api.metacpan.org
+      - Write dev-version module's 'meta-provides' info to the install.json file.
+        This allows Carton to write dev-version modules to the cpanfile.snapshot.
+
 1.7039  2015-06-28 18:05:10 PDT
    [Improvements]
       - Only enable softening of MakeMaker dependency when Module::Install is present (reported by haarg)
