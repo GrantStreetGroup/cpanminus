@@ -600,7 +600,7 @@ sub from_string_hash {
 
     return $self->_clone if $self->_accepts($version);
 
-    Carp::confess("illegal requirements: unequal exact version specified");
+    Carp::confess(sprintf "illegal requirements: unequal exact version specified: %s vs %s", $self->{version}, $version);
   }
 
   sub with_minimum {
