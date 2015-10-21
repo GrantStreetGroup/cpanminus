@@ -606,11 +606,19 @@ sub by_date {
     $b->{fields}{date} cmp $a->{fields}{date};                   # prefer new uploads, when searching for dev
 }
 
+sub by_matching_name {
+    # A release name that happens to match the module name/version is preferred regardless of release date
+    ($b->{fields}{release} eq $a->{fields}{module}[0]{name}.'-'.$b->{fields}{module}[0]{version})
+        <=>
+    ($a->{fields}{release} eq $a->{fields}{module}[0]{name}.'-'.$a->{fields}{module}[0]{version})
+}
+
 sub by_version {
     my %s = qw( latest 3  cpan 2  backpan 1 );
     $b->{_score} <=> $a->{_score} ||                             # version: higher version that satisfies the query
     $s{ $b->{fields}{status} } <=> $s{ $a->{fields}{status} } || # prefer non-BackPAN dist
-    ( $a->{_score} == 0 ? by_date : 0 ) # seems to make more sense than by first_come in this case
+    ( $a->{_score} == 0 ? (by_matching_name || by_date) : 0 ) # seems to make more sense than by first_come in this case
+
 }
 
 sub find_best_match {

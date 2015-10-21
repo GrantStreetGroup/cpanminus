@@ -2,7 +2,10 @@ See http://github.com/miyagawa/cpanminus/ for the latest development.
 
 {{$NEXT}}
 
-1.7039.1  2015-10-13 10:34:00 EDT
+1.7039.1  2015-10-21 15:00:00 EDT
+    PK: When there are ambiguious matches prefer dists that match the module name
+
+1.7039.2  2015-10-13 10:34:00 EDT
     PK: Applied all the GSG patches
       - Add an --api-only flag to keep cpanm from consulting packages02.txt 
         because in some darkpans that file may be inaccurate.
