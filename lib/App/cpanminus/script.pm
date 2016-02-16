@@ -2478,7 +2478,9 @@ sub configure_this {
             # with 0 even if header files are missing, to avoid receiving
             # tons of FAIL reports in such cases. So exit code can't be
             # trusted if it went well.
-            if ($self->configure([ $self->{perl}, "Makefile.PL" ], $depth)) {
+            (my $module = $dist->{module}) =~ s/::/_/g;
+            my $makefile_opts = $ENV{"PERL_MAKEFILE_OPTS_$module"} // '';
+            if ($self->configure([ $self->{perl}, "Makefile.PL", split /\s+/, $makefile_opts ], $depth)) {
                 $state->{configured_ok} = -e 'Makefile';
             }
             $state->{configured}++;
