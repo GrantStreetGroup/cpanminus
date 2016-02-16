@@ -21,7 +21,7 @@ BEGIN {
 my %fatpacked;
 
 $fatpacked{"App/cpanminus.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'APP_CPANMINUS';
-  package App::cpanminus;our$VERSION="1.7029.3";1;
+  package App::cpanminus;our$VERSION="1.7039.3";1;
 APP_CPANMINUS
 
 $fatpacked{"App/cpanminus/Dependency.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'APP_CPANMINUS_DEPENDENCY';
