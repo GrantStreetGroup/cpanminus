@@ -505,6 +505,29 @@ sub encode_json {
     $json;
 }
 
+sub decode_json {
+    my($self, $json) = @_;
+    require JSON::PP;
+
+    JSON::PP::decode_json($json);
+}
+
+sub uri_escape {
+    my($self, $fragment) = @_;
+    $fragment =~ s/([^A-Za-z0-9\-\._~])/uc sprintf("%%%02X", ord($1))/eg;
+    $fragment;
+}
+
+sub uri_params {
+    my($self, @params) = @_;
+    my @param_strings;
+    while (my $key = shift @params) {
+        my $value = shift @params;
+        push @param_strings, join '=', map $self->uri_escape($_), $key, $value;
+    }
+    return join '&', @param_strings;
+}
+
 # TODO extract this as a module?
 sub version_to_query {
       my($self, $module, $version, $supports_regexp) = @_;
@@ -638,7 +661,7 @@ sub search_metacpan {
     $self->chat("Searching $module ($version) on metacpan ...\n");
 
     my @cpan_apis = @{ $self->{mirror_apis} };
-    push @cpan_apis, 'http://api.metacpan.org/v0';
+    push @cpan_apis, 'http://fastapi.metacpan.org/v1/download_url/';
 
     for my $metacpan_uri (@cpan_apis) {
     
@@ -646,77 +669,97 @@ sub search_metacpan {
         # Metacpan is running an ancient version of ElasticSearch.
         # Assume other mirrors by default are running more recent versions.
         # TODO...Not sure how best to handle this
-        my $supports_regexp = $metacpan_uri !~ /api.metacpan.org/;
+        my $is_gsgpan = $metacpan_uri !~ /api.metacpan.org/;
     
-        my $query = { filtered => {
-            (@filter ? (filter => { and => \@filter }) : ()),
-            query => { nested => {
-                score_mode => 'max',
-                path => 'module',
-                query => { custom_score => {
-                    metacpan_script => "score_version_numified",
-                    query => { constant_score => {
-                        filter => { and => [
-                            { term => { 'module.authorized' => JSON::PP::true() } },
-                            { term => { 'module.indexed' => JSON::PP::true() } },
-                            { term => { 'module.name' => $module } },
-                            $self->version_to_query($module, $version, $supports_regexp),
-                        ] }
+        if ($is_gsgpan) {
+            my $query = { filtered => {
+                (@filter ? (filter => { and => \@filter }) : ()),
+                query => { nested => {
+                    score_mode => 'max',
+                    path => 'module',
+                    query => { custom_score => {
+                        metacpan_script => "score_version_numified",
+                        query => { constant_score => {
+                            filter => { and => [
+                                { term => { 'module.authorized' => JSON::PP::true() } },
+                                { term => { 'module.indexed' => JSON::PP::true() } },
+                                { term => { 'module.name' => $module } },
+                                $self->version_to_query($module, $version, 1),
+                            ] }
+                        } },
                     } },
                 } },
-            } },
-        } };
-    
-        my $module_uri = "$metacpan_uri/file/_search?source=";
-        $module_uri .= $self->encode_json({
-            query  => $query,
-            sort   => [ { date => 'desc' } ],
-            fields => [ 'date', 'release', 'author', 'module', 'status' ],
-        });
-    
-        my($release, $author, $module_version);
-    
-        my $module_json = $self->get($module_uri);
-        my $module_meta = eval { JSON::PP::decode_json($module_json) };
-        my $match = $self->find_best_match($module_meta);
-        if ($match) {
-            $release = $match->{release};
-            $author = $match->{author};
-            my $module_matched = (grep { $_->{name} eq $module } @{$match->{module}})[0];
-            $module_version = $module_matched->{version};
-        }
-    
-        unless ($release) {
-            $self->chat("! Could not find a release matching $module ($version) via CPAN API ($metacpan_uri).\n");
-            next;
-        }
-    
-        my $dist_uri = "$metacpan_uri/release/_search?source=";
-        $dist_uri .= $self->encode_json({
-            filter => { and => [
-                { term => { 'release.name' => $release } },
-                { term => { 'release.author' => $author } },
-            ]},
-            fields => [ 'download_url', 'stat', 'status' ],
-        });
-    
-        my $dist_json = $self->get($dist_uri);
-        my $dist_meta = eval { JSON::PP::decode_json($dist_json) };
-    
-        if ($dist_meta) {
-            $dist_meta = $dist_meta->{hits}{hits}[0]{fields};
-        }
-        if ($dist_meta && $dist_meta->{download_url}) {
-            (my $distfile = $dist_meta->{download_url}) =~ s!.+/authors/id/!!;
-            local $self->{mirrors} = $self->{mirrors};
-            if ($dist_meta->{status} eq 'backpan') {
-                push @{$self->{mirrors}}, 'http://backpan.perl.org'
-                  unless grep /backpan.perl.org/, @{$self->{mirrors}};
-            } elsif ($dist_meta->{stat}{mtime} > time()-24*60*60) {
-                push @{$self->{mirrors}}, 'http://cpan.metacpan.org'
-                  unless grep /cpan.metacpan.org/, @{$self->{mirrors}};
+            } };
+
+            my $module_uri = "$metacpan_uri/file/_search?source=";
+            $module_uri .= $self->encode_json({
+                query  => $query,
+                sort   => [ { date => 'desc' } ],
+                fields => [ 'date', 'release', 'author', 'module', 'status' ],
+            });
+
+            my($release, $author, $module_version);
+
+            my $module_json = $self->get($module_uri);
+            my $module_meta = eval { JSON::PP::decode_json($module_json) };
+            my $match = $self->find_best_match($module_meta);
+            if ($match) {
+                $release = $match->{release};
+                $author = $match->{author};
+                my $module_matched = (grep { $_->{name} eq $module } @{$match->{module}})[0];
+                $module_version = $module_matched->{version};
             }
-            return $self->cpan_module($module, $distfile, $module_version);
+
+            unless ($release) {
+                $self->chat("! Could not find a release matching $module ($version) via CPAN API ($metacpan_uri).\n");
+                next;
+            }
+
+            my $dist_uri = "$metacpan_uri/release/_search?source=";
+            $dist_uri .= $self->encode_json({
+                filter => { and => [
+                    { term => { 'release.name' => $release } },
+                    { term => { 'release.author' => $author } },
+                ]},
+                fields => [ 'download_url', 'stat', 'status' ],
+            });
+
+            my $dist_json = $self->get($dist_uri);
+            my $dist_meta = eval { JSON::PP::decode_json($dist_json) };
+            if ($dist_meta) {
+                $dist_meta = $dist_meta->{hits}{hits}[0]{fields};
+            }
+            if ($dist_meta && $dist_meta->{download_url}) {
+                (my $distfile = $dist_meta->{download_url}) =~ s!.+/authors/id/!!;
+                local $self->{mirrors} = $self->{mirrors};
+                if ($dist_meta->{status} eq 'backpan') {
+                    push @{$self->{mirrors}}, 'http://backpan.perl.org'
+                      unless grep /backpan.perl.org/, @{$self->{mirrors}};
+                } elsif ($dist_meta->{stat}{mtime} > time()-24*60*60) {
+                    push @{$self->{mirrors}}, 'http://cpan.metacpan.org'
+                      unless grep /cpan.metacpan.org/, @{$self->{mirrors}};
+                }
+                return $self->cpan_module($module, $distfile, $module_version);
+            }
+        } else {
+            my $url = $metacpan_uri . $module;
+
+            my $query = $self->uri_params(
+                ($version ? (version => $version) : ()),
+                ($self->{dev_release} ? (dev => 1) : ()),
+            );
+            $url .= '?' . $query
+                if length $query;
+
+            my $dist_json = $self->get($url);
+            my $dist_meta = eval { $self->decode_json($dist_json) } or warn "$@";
+
+            if ($dist_meta && $dist_meta->{download_url}) {
+                (my $distfile = $dist_meta->{download_url}) =~ s!.+/authors/id/!!;
+                local $self->{mirrors} = $self->{mirrors};
+                $self->{mirrors} = [ 'http://cpan.metacpan.org' ];
+                return $self->cpan_module($module, $distfile, $dist_meta->{version});
+            }
         }
     }
 
