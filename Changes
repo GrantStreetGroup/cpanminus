@@ -2,6 +2,12 @@ See http://github.com/miyagawa/cpanminus/ for the latest development.
 
 {{$NEXT}}
 
+1.7039.5  2018-12-11 12:56:36 EDT
+    MF: fix logging for metacpan queries
+
+1.7039.4  2018-11-15 11:39:10 EDT
+    MF: fastapi support
+
 1.7039.3  2016-02-16 13:27:00 EDT
     PK: Allow passing in of params to Makefile.PL via ENV
 
