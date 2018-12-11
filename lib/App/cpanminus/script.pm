@@ -752,7 +752,7 @@ sub search_metacpan {
                 if length $query;
 
             my $dist_json = $self->get($url);
-            my $dist_meta = eval { $self->decode_json($dist_json) } or warn "$@";
+            my $dist_meta = eval { $self->decode_json($dist_json) };
 
             if ($dist_meta && $dist_meta->{download_url}) {
                 (my $distfile = $dist_meta->{download_url}) =~ s!.+/authors/id/!!;
@@ -760,6 +760,8 @@ sub search_metacpan {
                 $self->{mirrors} = [ 'http://cpan.metacpan.org' ];
                 return $self->cpan_module($module, $distfile, $dist_meta->{version});
             }
+
+            $self->chat("! Could not find a release matching $module".($version?" ($version)":'')." via CPAN API ($metacpan_uri).\n");
         }
     }
 
