@@ -1367,6 +1367,9 @@ sub configure {
         $ENV{PERL_MB_OPT} .= " --pureperl-only";
     }
 
+    local $ENV{PERL_USE_UNSAFE_INC} = 1
+        unless exists $ENV{PERL_USE_UNSAFE_INC};
+
     $cmd = $self->append_args($cmd, 'configure') if $depth == 0;
 
     local $self->{verbose} = $self->{verbose} || $self->{interactive};
@@ -1377,6 +1380,9 @@ sub build {
     my($self, $cmd, $distname, $depth) = @_;
 
     local $ENV{PERL_MM_USE_DEFAULT} = !$self->{interactive};
+
+    local $ENV{PERL_USE_UNSAFE_INC} = 1
+        unless exists $ENV{PERL_USE_UNSAFE_INC};
 
     $cmd = $self->append_args($cmd, 'build') if $depth == 0;
 
@@ -1399,6 +1405,9 @@ sub test {
 
     # https://github.com/Perl-Toolchain-Gang/toolchain-site/blob/master/lancaster-consensus.md
     local $ENV{NONINTERACTIVE_TESTING} = !$self->{interactive};
+
+    local $ENV{PERL_USE_UNSAFE_INC} = 1
+        unless exists $ENV{PERL_USE_UNSAFE_INC};
 
     $cmd = $self->append_args($cmd, 'test') if $depth == 0;
 
@@ -1425,6 +1434,9 @@ sub install {
     if ($depth == 0 && $self->{test_only}) {
         return 1;
     }
+
+    local $ENV{PERL_USE_UNSAFE_INC} = 1
+        unless exists $ENV{PERL_USE_UNSAFE_INC};
 
     if ($self->{sudo}) {
         unshift @$cmd, "sudo";
