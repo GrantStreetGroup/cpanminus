@@ -1,6 +1,7 @@
 See http://github.com/miyagawa/cpanminus/ for the latest development.
 
 {{$NEXT}}
+    MF: set PERL_USE_UNSAFE_INC so . is included in @INC
 
 1.7039.5  2018-12-11 12:56:36 EDT
     MF: fix logging for metacpan queries
